@@ -28,6 +28,7 @@
     clickNextButton: true,
     continuousRun: true,
     autoSkipNoTaskPages: true,
+    autoAnswerChoiceQuizzes: true,
     loopPauseMs: 2500,
     nextPageWaitMs: 60000,
   };
@@ -40,6 +41,8 @@
   let activeWorkArea = null;
   let lastProcessedQuizArea = null;
   const processedQuizAreas = new WeakSet();
+  const processedClassicTrainerAreas = new WeakSet();
+  const processedChoiceQuizzes = new WeakSet();
   const clickedPassThroughButtons = new WeakSet();
 
   function createStatus() {
@@ -213,9 +216,9 @@
   }
 
   function selectWorkArea() {
-    const nextQuizArea = getNextQuizWorkArea();
-    if (nextQuizArea) {
-      activeWorkArea = nextQuizArea;
+    const action = getBottomAction();
+    if (action?.type === 'code') {
+      activeWorkArea = action.element;
       return activeWorkArea;
     }
 
@@ -307,29 +310,207 @@
       .find(isUsable);
   }
 
+  function getPassThroughButtonCandidates() {
+    if (!config.autoSkipNoTaskPages) return [];
+
+    const passThroughTexts = [
+      'Далее',
+      'Следующее задание',
+      'Следующий урок',
+      'К следующему уроку',
+      'Продолжить',
+      'Можно подробнее?',
+      'Как это сделать?',
+    ];
+
+    return [
+      getNextButton(),
+      ...document.querySelectorAll('[data-test-id^="theory-action-button-"]'),
+      ...document.querySelectorAll('.content-expander__button'),
+      ...[...document.querySelectorAll('button,[role="button"],a')].filter((element) =>
+        passThroughTexts.includes(normalize(element.textContent)),
+      ),
+    ]
+      .map(closestButton)
+      .filter(Boolean)
+      .filter((button, index, buttons) => buttons.indexOf(button) === index)
+      .filter((button) => !clickedPassThroughButtons.has(button))
+      .filter(isUsable);
+  }
+
   function hasTaskControls() {
-    return Boolean(getCheckableQuizAreas().length || document.querySelector('[data-test-id="check-task-button"]'));
+    return Boolean(
+      getCheckableQuizAreas().length ||
+      getNextChoiceQuizForm() ||
+      document.querySelector('[data-test-id="check-task-button"]'),
+    );
+  }
+
+  function randomInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  function shuffle(items) {
+    const result = [...items];
+    for (let index = result.length - 1; index > 0; index -= 1) {
+      const swapIndex = randomInt(0, index);
+      [result[index], result[swapIndex]] = [result[swapIndex], result[index]];
+    }
+    return result;
+  }
+
+  function getChoiceQuizForms() {
+    if (!config.autoAnswerChoiceQuizzes) return [];
+
+    return [...document.querySelectorAll('form.quiz, .quiz_type_select')]
+      .filter((form, index, forms) => forms.indexOf(form) === index)
+      .filter((form) => !processedChoiceQuizzes.has(form))
+      .filter(isVisibleQuizArea)
+      .filter((form) => form.querySelector('input[type="radio"], input[type="checkbox"]'))
+      .filter((form) => form.querySelector('button[type="submit"], .quiz__submit'));
+  }
+
+  function getNextChoiceQuizForm() {
+    const forms = getChoiceQuizForms();
+    return forms[forms.length - 1] || null;
+  }
+
+  function getClassicTrainerCodeAction() {
+    const checkButton = closestButton(document.querySelector('[data-test-id="check-task-button"]'));
+    const solutionButton = closestButton(document.querySelector('[data-test-id="trainer-author-solution-student-button"]'));
+    const anchor = checkButton || solutionButton;
+    if (!anchor) return null;
+
+    const editor = document.querySelector('.trainer-editor, .monaco-editor, .CodeMirror, textarea');
+    if (!editor) return null;
+
+    const candidates = [
+      anchor.closest('.trainer-task'),
+      anchor.closest('.trainer__body'),
+      anchor.closest('.trainer__lesson'),
+      anchor.closest('main'),
+      document.querySelector('.trainer-task'),
+      document.querySelector('.trainer__body'),
+      document.querySelector('main'),
+      document,
+    ].filter(Boolean);
+    const workArea = candidates.find((area) => area.contains?.(anchor) && area.contains?.(editor)) || document;
+    if (processedClassicTrainerAreas.has(workArea) || processedClassicTrainerAreas.has(anchor)) return null;
+
+    return { type: 'code', element: workArea, anchor };
+  }
+
+  function getLastByDocumentOrder(items) {
+    return items
+      .filter(Boolean)
+      .sort((left, right) => {
+        if (left === right) return 0;
+        return left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+      })
+      .at(-1) || null;
+  }
+
+  function getLastActionByDocumentOrder(actions) {
+    return actions
+      .filter((action) => action?.anchor)
+      .sort((left, right) => {
+        if (left.anchor === right.anchor) return 0;
+        return left.anchor.compareDocumentPosition(right.anchor) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+      })
+      .at(-1) || null;
+  }
+
+  function getBottomAction() {
+    const quizCodeArea = getNextQuizWorkArea();
+    const classicCodeAction = getClassicTrainerCodeAction();
+    const choiceForm = getNextChoiceQuizForm();
+    const passThroughButton = getLastByDocumentOrder(getPassThroughButtonCandidates());
+    const bottomTask = getLastActionByDocumentOrder([
+      quizCodeArea ? { type: 'code', element: quizCodeArea, anchor: quizCodeArea } : null,
+      classicCodeAction,
+      choiceForm ? { type: 'choice-quiz', element: choiceForm, anchor: choiceForm } : null,
+      passThroughButton ? { type: 'pass-through', element: passThroughButton, anchor: passThroughButton } : null,
+    ]);
+
+    if (bottomTask) return { type: bottomTask.type, element: bottomTask.element };
+
+    const nextLessonUrl = getNextLessonUrlFromPreloadedData();
+    if (nextLessonUrl) return { type: 'pass-through-url', url: nextLessonUrl };
+
+    return null;
+  }
+
+  function getChoiceQuizSubmitButton(form) {
+    if (!form?.querySelector) return null;
+
+    return firstUsableOrFirst([
+      form.querySelector('button[type="submit"]'),
+      form.querySelector('.quiz__submit'),
+      ...[...form.querySelectorAll('button,[role="button"]')].filter((element) =>
+        ['Проверить', 'Ответить', 'Отправить', 'Далее', 'Продолжить'].includes(normalize(element.textContent)),
+      ),
+    ]);
+  }
+
+  function clickChoiceInput(input) {
+    const label = input.closest?.('label') || document.querySelector(`label[for="${CSS.escape(input.id || '')}"]`);
+    const target = label || input;
+    target.scrollIntoView({ block: 'center', inline: 'center' });
+    target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse' }));
+    target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    target.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse' }));
+    target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    target.click();
+
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  async function answerChoiceQuiz(form) {
+    const inputs = [...form.querySelectorAll('input[type="radio"], input[type="checkbox"]')]
+      .filter((input) => !input.disabled && input.getAttribute('aria-disabled') !== 'true');
+
+    if (!inputs.length) return false;
+
+    const radioInputs = inputs.filter((input) => input.type === 'radio');
+    const checkboxInputs = inputs.filter((input) => input.type === 'checkbox');
+    const isSingleChoice =
+      radioInputs.length > 0 ||
+      form.classList.contains('quiz_options-type_radio') ||
+      form.getAttribute('data-test-id')?.includes('quiz-radio');
+    const sourceInputs = isSingleChoice ? radioInputs : checkboxInputs;
+    if (!sourceInputs.length) return false;
+
+    const choicesCount = isSingleChoice ? 1 : randomInt(1, Math.min(sourceInputs.length, 3));
+    const choices = shuffle(sourceInputs).slice(0, choicesCount);
+
+    for (const input of choices) {
+      clickChoiceInput(input);
+      await sleep(250);
+    }
+
+    const submitButton = await waitFor(() => {
+      const button = getChoiceQuizSubmitButton(form);
+      return isUsable(button) ? button : null;
+    }, 10000);
+
+    if (!submitButton) return false;
+
+    clickElementRelaxed(submitButton, 'Random quiz answer');
+    processedChoiceQuizzes.add(form);
+    await sleep(config.loopPauseMs);
+    return true;
   }
 
   function getTheoryOnlyActionButton() {
-    if (!config.autoSkipNoTaskPages || hasTaskControls()) return null;
-
-    const candidates = [
-      ...document.querySelectorAll('[data-test-id^="theory-action-button-"]'),
-      ...document.querySelectorAll('.content-expander__button'),
-    ]
-      .map(closestButton)
-      .filter((button, index, buttons) => button && buttons.indexOf(button) === index)
-      .filter((button) => !clickedPassThroughButtons.has(button));
-
-    return candidates.find(isUsable) || null;
+    return getPassThroughButtonCandidates().find((button) =>
+      button.matches?.('[data-test-id^="theory-action-button-"], .content-expander__button'),
+    ) || null;
   }
 
   function getPassThroughPageButton() {
-    if (!config.autoSkipNoTaskPages || hasTaskControls()) return null;
-    const nextButton = getNextButton();
-    if (nextButton && !clickedPassThroughButtons.has(nextButton)) return nextButton;
-    return getTheoryOnlyActionButton();
+    if (!config.autoSkipNoTaskPages) return null;
+    return getPassThroughButtonCandidates()[0] || null;
   }
 
   function getNextLessonUrlFromPreloadedData() {
@@ -489,8 +670,11 @@
     const monacoApi = window.monaco;
     const areas = getWorkAreas();
     const editorNodes = [
-      ...new Set(areas.flatMap((area) => [...area.querySelectorAll?.('.monaco-editor') || []])),
-    ];
+      ...new Set(areas.flatMap((area) => [
+        ...area.querySelectorAll?.('.trainer-editor__code-editor_opened .monaco-editor') || [],
+        ...area.querySelectorAll?.('.monaco-editor') || [],
+      ])),
+    ].filter(isVisibleQuizArea);
     const editors = monacoApi?.editor?.getEditors?.() || [];
     const scopedEditor = editors.find((editor) => {
       const node = editor.getDomNode?.();
@@ -513,6 +697,17 @@
     }
 
     const models = monacoApi?.editor?.getModels?.() || [];
+    const scopedModel = editorNodes
+      .map((node) => node.getAttribute('data-uri'))
+      .filter(Boolean)
+      .map((uri) => models.find((model) => model.uri?.toString?.() === uri || String(model.uri || '') === uri))
+      .find(Boolean);
+
+    if (scopedModel?.setValue) {
+      scopedModel.setValue(text);
+      return true;
+    }
+
     const monacoEditorCount = document.querySelectorAll('.monaco-editor').length;
     if (models.length && (models.length === 1 || monacoEditorCount <= 1)) {
       const model =
@@ -645,7 +840,8 @@
   async function clickNextButton() {
     if (!config.clickNextButton) return false;
 
-    if (getNextQuizWorkArea()) return false;
+    const action = getBottomAction();
+    if (action?.type === 'code' || action?.type === 'choice-quiz') return false;
 
     const nextButton = await waitFor(() => {
       const button = getNextButton();
@@ -663,17 +859,26 @@
       processedQuizAreas.add(activeWorkArea);
       lastProcessedQuizArea = activeWorkArea;
       activeWorkArea = null;
+      return;
+    }
+
+    const classicCodeAction = getClassicTrainerCodeAction();
+    if (classicCodeAction) {
+      processedClassicTrainerAreas.add(classicCodeAction.element);
+      processedClassicTrainerAreas.add(classicCodeAction.anchor);
+      if (activeWorkArea === classicCodeAction.element) activeWorkArea = null;
     }
   }
 
-  async function handlePassThroughPage(cycleNumber = 1) {
+  async function handlePassThroughPage(cycleNumber = 1, providedButton = null) {
     const previousUrl = window.location.href;
 
     for (let attempt = 1; attempt <= 5; attempt += 1) {
       if (isStopRequested()) return { stopped: true };
 
       const button = await waitFor(() => {
-        const candidate = getPassThroughPageButton();
+        const action = getBottomAction();
+        const candidate = attempt === 1 && providedButton ? providedButton : action?.type === 'pass-through' ? action.element : getPassThroughPageButton();
         return isUsable(candidate) ? candidate : null;
       }, 5000);
 
@@ -687,8 +892,8 @@
         return { nextClicked: true, passThrough: true };
       }
 
-      const taskAppeared = selectWorkArea();
-      if (taskAppeared && (getCheckButton(taskAppeared) || getSolutionButton(taskAppeared))) {
+      const action = getBottomAction();
+      if (action?.type === 'code' || action?.type === 'choice-quiz') {
         return { nextClicked: false, passThrough: true, continueSamePage: true };
       }
     }
@@ -703,21 +908,63 @@
     return { nextClicked: false, passThrough: true };
   }
 
+  async function handleChoiceQuiz(cycleNumber = 1, providedForm = null) {
+    const form = providedForm || getNextChoiceQuizForm();
+    if (!form) return { nextClicked: false, choiceQuiz: true };
+
+    log(`Cycle ${cycleNumber}: answering a choice quiz...`);
+    const answered = await answerChoiceQuiz(form);
+    if (!answered) return { nextClicked: false, choiceQuiz: true };
+
+    const nextButton = await waitFor(() => {
+      const button = getNextButton();
+      return isUsable(button) ? button : null;
+    }, 10000);
+
+    if (nextButton) {
+      clickElementRelaxed(nextButton, 'Далее после опроса');
+      return { nextClicked: true, choiceQuiz: true };
+    }
+
+    const nextLessonUrl = getNextLessonUrlFromPreloadedData();
+    if (nextLessonUrl) {
+      log(`Cycle ${cycleNumber}: choice quiz answered, opening next lesson directly.`);
+      window.location.assign(nextLessonUrl);
+      return { nextClicked: true, choiceQuiz: true };
+    }
+
+    return { nextClicked: false, choiceQuiz: true, continueSamePage: Boolean(getNextChoiceQuizForm()) };
+  }
+
   async function runSingleCycle(cycleNumber = 1) {
     try {
       if (isStopRequested()) return { stopped: true };
 
       log(`Cycle ${cycleNumber}: waiting for the task UI...`);
       const initialUi = await waitFor(() => {
+        const action = getBottomAction();
+        if (action?.type === 'code') {
+          activeWorkArea = action.element;
+          return action;
+        }
+        if (action?.type === 'choice-quiz' || action?.type === 'pass-through' || action?.type === 'pass-through-url') {
+          return action;
+        }
+
         const area = selectWorkArea();
-        if (area && (getCheckButton(area) || getSolutionButton(area))) return 'task';
-        if (getPassThroughPageButton() || getNextLessonUrlFromPreloadedData()) return 'pass-through';
+        if (area && (getCheckButton(area) || getSolutionButton(area))) {
+          return { type: 'task', element: area };
+        }
         return null;
       }, 30000);
       if (isStopRequested()) return { stopped: true };
 
-      if (initialUi === 'pass-through') {
-        return handlePassThroughPage(cycleNumber);
+      if (initialUi?.type === 'choice-quiz') {
+        return handleChoiceQuiz(cycleNumber, initialUi.element);
+      }
+
+      if (initialUi?.type === 'pass-through' || initialUi?.type === 'pass-through-url') {
+        return handlePassThroughPage(cycleNumber, initialUi.element);
       }
 
       if (!activeWorkArea) {
@@ -844,9 +1091,7 @@
     await sleep(config.loopPauseMs);
     const taskUi = await waitFor(() => {
       activeWorkArea = null;
-      const area = selectWorkArea();
-      if (area && (getCheckButton(area) || getSolutionButton(area))) return true;
-      return Boolean(getPassThroughPageButton() || getNextLessonUrlFromPreloadedData());
+      return Boolean(getBottomAction());
     }, config.nextPageWaitMs, 500);
     return Boolean(taskUi);
   }
@@ -877,7 +1122,7 @@
 
         if (!result?.nextClicked) {
           await sleep(config.loopPauseMs);
-          if (getNextQuizWorkArea() || getPassThroughPageButton() || getNextLessonUrlFromPreloadedData()) {
+          if (getBottomAction()) {
             cycleNumber += 1;
             continue;
           }

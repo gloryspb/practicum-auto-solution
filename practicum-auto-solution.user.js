@@ -41,7 +41,7 @@
   let activeWorkArea = null;
   let lastProcessedQuizArea = null;
   const processedQuizAreas = new WeakSet();
-  const processedClassicTrainerAreas = new WeakSet();
+  const processedClassicTrainerAnchors = new WeakSet();
   const processedChoiceQuizzes = new WeakSet();
   const clickedPassThroughButtons = new WeakSet();
 
@@ -395,7 +395,7 @@
       document,
     ].filter(Boolean);
     const workArea = candidates.find((area) => area.contains?.(anchor) && area.contains?.(editor)) || document;
-    if (processedClassicTrainerAreas.has(workArea) || processedClassicTrainerAreas.has(anchor)) return null;
+    if (processedClassicTrainerAnchors.has(anchor) && isUsable(getNextButton())) return null;
 
     return { type: 'code', element: workArea, anchor };
   }
@@ -851,6 +851,7 @@
     if (!nextButton) return false;
 
     clickElement(nextButton, 'Далее');
+    clickedPassThroughButtons.add(closestButton(nextButton));
     return true;
   }
 
@@ -864,8 +865,7 @@
 
     const classicCodeAction = getClassicTrainerCodeAction();
     if (classicCodeAction) {
-      processedClassicTrainerAreas.add(classicCodeAction.element);
-      processedClassicTrainerAreas.add(classicCodeAction.anchor);
+      processedClassicTrainerAnchors.add(classicCodeAction.anchor);
       if (activeWorkArea === classicCodeAction.element) activeWorkArea = null;
     }
   }
@@ -1081,19 +1081,22 @@
   async function waitForNextPage(previousUrl, cycleNumber) {
     if (isStopRequested()) return false;
 
-    log(`Cycle ${cycleNumber}: waiting for the next page...`);
-    const urlChanged = await waitFor(() => window.location.href !== previousUrl, config.nextPageWaitMs, 500);
-    if (!urlChanged) {
-      log('Next page did not load in time. Continuous mode paused.');
+    log(`Cycle ${cycleNumber}: waiting for the next task...`);
+    await sleep(config.loopPauseMs);
+    const nextAction = await waitFor(() => {
+      activeWorkArea = null;
+      const action = getBottomAction();
+      if (!action) return null;
+      if (window.location.href === previousUrl && action.type === 'pass-through-url') return null;
+      return action;
+    }, config.nextPageWaitMs, 500);
+
+    if (!nextAction) {
+      log('Next task did not appear in time. Continuous mode paused.');
       return false;
     }
 
-    await sleep(config.loopPauseMs);
-    const taskUi = await waitFor(() => {
-      activeWorkArea = null;
-      return Boolean(getBottomAction());
-    }, config.nextPageWaitMs, 500);
-    return Boolean(taskUi);
+    return true;
   }
 
   async function run() {

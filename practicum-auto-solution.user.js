@@ -292,9 +292,11 @@
       '[data-test-id="next-task-button"]',
       '[data-test-id="trainer-footer-next-task-button"]',
       '[data-test-id="trainer-footer-next-lesson-button"]',
+      '[data-test-id="theory-panel-close-button"]',
       '.trainer-footer__next-task-button',
       '.trainer-footer__next-lesson-button',
       '.next-lesson-control__button',
+      '.theory-panel__theory-close-button',
     ];
 
     const selectorButtons = selectors
@@ -321,6 +323,8 @@
       'Продолжить',
       'Можно подробнее?',
       'Как это сделать?',
+      'Перейти к заданию',
+      'Готово',
     ];
 
     return [
@@ -539,7 +543,7 @@
   }
 
   function clickElementRelaxed(element, label) {
-    const target = closestButton(element);
+    const target = closestButton(element) || element;
     if (!target) return false;
     rememberWorkArea(target);
     target.scrollIntoView({ block: 'center', inline: 'center' });
@@ -612,6 +616,85 @@
     const solutionPanel = panels[1] || panels.find((panel) => panel.querySelector('.author-solution-modal__clipboard-button')) || panels[0];
     if (!solutionPanel) return '';
     return extractCodeFromPanel(solutionPanel);
+  }
+
+  function normalizeFilePath(path) {
+    return normalize(path)
+      .replace(/^file:\/+/, '')
+      .replace(/^\/+/, '')
+      .replace(/\\/g, '/')
+      .replace(/^workspace\//, '');
+  }
+
+  function normalizeCodeForCompare(code) {
+    return (code || '').replace(/\r\n/g, '\n').replace(/\s+$/g, '');
+  }
+
+  function shouldSkipSolutionFile(path) {
+    return /\.(css|js|json)$/i.test(normalizeFilePath(path));
+  }
+
+  function getModalFilePanels(modal) {
+    return [...modal.querySelectorAll('.author-solution-modal__code-tabs-panel')]
+      .filter((panel) => panel.querySelector('.tab__text'));
+  }
+
+  function getPanelFileTabs(panel) {
+    return [...panel.querySelectorAll('.tab')]
+      .map((tab) => ({
+        tab,
+        path: normalizeFilePath(tab.querySelector('.tab__text')?.textContent || ''),
+      }))
+      .filter((item) => item.path);
+  }
+
+  function getActivePanelContent(panel) {
+    return panel.querySelector('.tabs__item-content_visible') || panel;
+  }
+
+  async function selectModalFileTab(panel, filePath) {
+    const normalizedPath = normalizeFilePath(filePath);
+    const item = getPanelFileTabs(panel).find((candidate) => candidate.path === normalizedPath);
+    if (!item) return false;
+
+    clickElementRelaxed(item.tab, `Solution file tab: ${normalizedPath}`);
+    await sleep(250);
+    return true;
+  }
+
+  async function extractSampleSolutionFiles(modal) {
+    const panels = getModalFilePanels(modal);
+    if (panels.length < 2) return [];
+
+    const currentPanel = panels[0];
+    const targetPanel = panels[1];
+    const paths = [
+      ...new Set(getPanelFileTabs(targetPanel).map((item) => item.path)),
+    ].filter((path) => !shouldSkipSolutionFile(path));
+    const files = [];
+
+    for (const path of paths) {
+      if (isStopRequested()) break;
+
+      await selectModalFileTab(currentPanel, path);
+      await selectModalFileTab(targetPanel, path);
+      await sleep(150);
+
+      const currentCode = extractCodeFromPanel(getActivePanelContent(currentPanel));
+      const targetCode = extractCodeFromPanel(getActivePanelContent(targetPanel));
+
+      if (normalizeCodeForCompare(currentCode) !== normalizeCodeForCompare(targetCode)) {
+        files.push({ path, code: targetCode, currentCode });
+      }
+    }
+
+    return files;
+  }
+
+  function formatSolutionFilesForClipboard(files) {
+    return files
+      .map((file) => `# ${file.path}\n${file.code}`)
+      .join('\n\n');
   }
 
   async function copyText(text) {
@@ -759,6 +842,156 @@
     return pasteIntoCodeMirror(text) || pasteIntoMonaco(text) || pasteIntoPlainEditor(text);
   }
 
+  function getProjectFileNodes() {
+    const nodes = [...document.querySelectorAll('.tree-node-file-system__name')]
+      .map((node) => {
+        const label = normalize(
+          node.querySelector('.files-tree__node-name-container .element-hint__wrapper')?.textContent ||
+          node.querySelector('.files-tree__node-name-container')?.textContent ||
+          '',
+        );
+        if (!label) return null;
+
+        const styleLevel = node.style?.getPropertyValue('--nesting-level') || '';
+        const attrLevel = node.getAttribute('style')?.match(/--nesting-level:\s*(\d+)/)?.[1] || '';
+        const level = Number(styleLevel || attrLevel || 1);
+        const isFolder = Boolean(
+          node.querySelector('.files-tree__node-folder-icon, .icon-folder, .tree-node-file-system__name-arrow'),
+        );
+
+        return { node, label, level, isFolder };
+      })
+      .filter(Boolean);
+
+    const stack = [];
+    const files = [];
+
+    for (const item of nodes) {
+      stack[item.level - 1] = item.label;
+      stack.length = item.level;
+
+      if (!item.isFolder) {
+        files.push({
+          path: normalizeFilePath(stack.join('/')),
+          node: item.node,
+          label: item.label,
+        });
+      }
+    }
+
+    return files;
+  }
+
+  async function expandProjectTree() {
+    const expandButtons = [...document.querySelectorAll('button[aria-label="Р Р°Р·РІРµСЂРЅСѓС‚СЊ"], button[aria-label="Развернуть"]')]
+      .map(closestButton)
+      .filter(Boolean)
+      .filter(isUsable);
+
+    for (const button of expandButtons) {
+      clickElementRelaxed(button, 'Expand file tree');
+      await sleep(300);
+    }
+  }
+
+  function getMonacoModelForPath(path) {
+    const normalizedPath = normalizeFilePath(path);
+    const models = window.monaco?.editor?.getModels?.() || [];
+
+    return models.find((model) => {
+      const uri = normalizeFilePath(model.uri?.toString?.() || String(model.uri || ''));
+      return uri === normalizedPath || uri.endsWith(`/${normalizedPath}`);
+    }) || null;
+  }
+
+  function getActiveMonacoPath() {
+    const activeEditor = document.querySelector('.trainer-editor__code-editor_opened .monaco-editor');
+    const visibleEditor = [...document.querySelectorAll('.monaco-editor')].find(isVisibleQuizArea);
+    return normalizeFilePath(activeEditor?.getAttribute('data-uri') || visibleEditor?.getAttribute('data-uri') || '');
+  }
+
+  function isActiveMonacoPath(path) {
+    const normalizedPath = normalizeFilePath(path);
+    const activePath = getActiveMonacoPath();
+    return activePath === normalizedPath || activePath.endsWith(`/${normalizedPath}`);
+  }
+
+  async function selectProjectFile(path) {
+    const normalizedPath = normalizeFilePath(path);
+    let file = getProjectFileNodes().find((item) => item.path === normalizedPath);
+
+    if (getMonacoModelForPath(normalizedPath) || isActiveMonacoPath(normalizedPath)) return true;
+
+    if (!file) {
+      await expandProjectTree();
+      file = getProjectFileNodes().find((item) => item.path === normalizedPath);
+    }
+
+    if (!file) return false;
+
+    clickElementRelaxed(file.node, `Open file: ${normalizedPath}`);
+    file.node.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+
+    const opened = await waitFor(() => {
+      const model = getMonacoModelForPath(normalizedPath);
+      if (model) return model;
+
+      return isActiveMonacoPath(normalizedPath) ? true : null;
+    }, 10000, 250);
+
+    await sleep(250);
+    return Boolean(opened);
+  }
+
+  function setMonacoFileValue(path, code) {
+    const normalizedPath = normalizeFilePath(path);
+    const model = getMonacoModelForPath(normalizedPath);
+    const editor = (window.monaco?.editor?.getEditors?.() || []).find((candidate) => {
+      const candidateModel = candidate.getModel?.();
+      const uri = normalizeFilePath(candidateModel?.uri?.toString?.() || String(candidateModel?.uri || ''));
+      return uri === normalizedPath || uri.endsWith(`/${normalizedPath}`);
+    });
+
+    const targetModel = editor?.getModel?.() || model;
+
+    if (targetModel?.setValue) {
+      targetModel.setValue(code);
+      editor.focus?.();
+      const node = editor?.getDomNode?.();
+      node?.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: code }));
+      node?.dispatchEvent(new Event('change', { bubbles: true }));
+      node?.querySelector?.('textarea')?.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: code }));
+      return true;
+    }
+
+    return false;
+  }
+
+  async function pasteSolutionFilesIntoEditor(files) {
+    if (!config.pasteIntoEditor || !files.length) return false;
+
+    let pastedCount = 0;
+
+    for (const file of files) {
+      if (isStopRequested()) break;
+
+      const opened = await selectProjectFile(file.path);
+      if (!opened) {
+        console.warn('[PracticumAutoSolution] Could not find file in tree:', file.path);
+        continue;
+      }
+
+      const pasted = setMonacoFileValue(file.path, file.code);
+      if (pasted) pastedCount += 1;
+      if (!pasted) {
+        console.warn('[PracticumAutoSolution] Could not paste into file:', file.path);
+      }
+      await sleep(400);
+    }
+
+    return pastedCount > 0;
+  }
+
   async function closeEditorNotifications() {
     const areas = getWorkAreas();
     const closeSelectors = [
@@ -812,12 +1045,14 @@
     if (!config.checkSolutionBeforeNext) return false;
 
     const quizArea = getCurrentQuizWorkArea();
-    if (quizArea) activeWorkArea = quizArea;
+    const classicCodeAction = quizArea ? null : getClassicTrainerCodeAction();
+    const checkArea = quizArea || classicCodeAction?.element || activeWorkArea || document;
+    activeWorkArea = checkArea;
     const laterQuizCountBeforeCheck = quizArea ? getCheckableQuizAreasAfter(quizArea).length : 0;
 
     await sleep(700);
     const checkButton = await waitFor(() => {
-      const button = getCheckButton(quizArea || activeWorkArea);
+      const button = getCheckButton(checkArea) || getCheckButton(document);
       return isUsable(button) ? button : null;
     }, 30000);
 
@@ -1041,19 +1276,36 @@
       }
 
       await sleep(500);
-      const code = extractSampleSolution(modal);
-      if (!code) {
+      const solutionFiles = await extractSampleSolutionFiles(modal);
+      const code = solutionFiles.length ? formatSolutionFilesForClipboard(solutionFiles) : extractSampleSolution(modal);
+      if (!code && !solutionFiles.length) {
         throw new Error('Could not extract sample solution text from the modal.');
       }
 
       const copied = await copyText(code);
       const closedEditorNotifications = await closeEditorNotifications();
-      let pasted = pasteIntoEditor(code);
-      const closed = await closeSolutionModal();
-      if (!pasted) {
+
+      let pasted = false;
+      let closed = false;
+
+      if (solutionFiles.length) {
+        closed = await closeSolutionModal();
+        await closeEditorNotifications();
+        pasted = await pasteSolutionFilesIntoEditor(solutionFiles);
+      } else {
+        pasted = pasteIntoEditor(code);
+        closed = await closeSolutionModal();
+        if (!pasted) {
+          await closeEditorNotifications();
+          pasted = pasteIntoEditor(code);
+        }
+      }
+
+      if (!pasted && !solutionFiles.length) {
         await closeEditorNotifications();
         pasted = pasteIntoEditor(code);
       }
+
       const checked = await checkSolutionBeforeNext();
       if (checked) markActiveWorkAreaProcessed();
       const nextClicked = await clickNextButton();
@@ -1062,6 +1314,7 @@
           `Cycle ${cycleNumber} done.`,
           copied ? 'Sample solution copied to clipboard.' : 'Clipboard copy was skipped or blocked.',
           closedEditorNotifications ? `Editor notifications closed: ${closedEditorNotifications}.` : 'No editor notifications found.',
+          solutionFiles.length ? `Changed files found: ${solutionFiles.length}.` : 'Single-file solution detected.',
           pasted ? 'Sample solution pasted into the editor.' : 'Could not paste into the editor automatically.',
           closed ? 'Solution modal closed.' : 'Could not close the solution modal automatically.',
           checked ? 'Correct solution checked.' : 'Could not run or confirm the final check.',
@@ -1069,8 +1322,8 @@
         ].join('\n'),
       );
 
-      window.__practicumLastSampleSolution = code;
-      return { code, nextClicked };
+      window.__practicumLastSampleSolution = solutionFiles.length ? solutionFiles : code;
+      return { code, solutionFiles, nextClicked };
     } catch (error) {
       console.error('[PracticumAutoSolution]', error);
       log(`Error: ${error.message}`);
